@@ -1,5 +1,5 @@
 import asyncdispatch, asynchttpserver, asyncnet, base64, httpclient, httpcore,
-    nativesockets, net, random, std/sha1, streams, strformat, strutils, uri
+    nativesockets, net, random, checksums/sha1, streams, strformat, strutils, uri
 
 type
   ReadyState* = enum

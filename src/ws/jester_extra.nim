@@ -1,10 +1,11 @@
-import asyncdispatch, asynchttpserver, base64, jester, jester/private/utils,
-    nativesockets, std/sha1, strutils, ws
+import asyncdispatch, asynchttpserver, jesterfork, jesterfork/private/utils,
+    nativesockets, strutils
+import ../ws
 
 when useHttpBeast:
-  import httpbeast, options, asyncnet
+  import httpbeastfork, options, asyncnet
 
-  proc newWebSocket*(req: httpbeast.Request): Future[WebSocket] {.async.} =
+  proc newWebSocket*(req: httpbeastfork.Request): Future[WebSocket] {.async.} =
     ## Creates a new socket from an httpbeast request.
     try:
       let headers = req.headers.get
@@ -31,6 +32,6 @@ when useHttpBeast:
         "Failed to create WebSocket from request: " & getCurrentExceptionMsg()
       )
 
-proc newWebSocket*(req: jester.Request): Future[WebSocket] {.async.} =
+proc newWebSocket*(req: jesterfork.Request): Future[WebSocket] {.async.} =
   ## Creates a new socket from a jester request.
   return await newWebSocket(req.getNativeReq())
