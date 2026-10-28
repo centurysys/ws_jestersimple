@@ -6,6 +6,7 @@ import asyncdispatch, asynchttpserver, asyncnet, base64, httpclient, httpcore,
 const
   DefaultMaxFrameBytes* = 1024 * 1024
   DefaultMaxMessageBytes* = 4 * 1024 * 1024
+  DefaultMaxPendingSendBytes* = 4 * 1024 * 1024
 
 type
   ReadyState* = enum
@@ -30,6 +31,10 @@ type
     heartbeatSentTicks: int64
     heartbeatExpired: bool
     pingGeneration: uint64
+    writeTimeoutMs: int
+    maxPendingSendBytes: int
+    queuedWriteBytes: int
+    writeTail: Future[void]
 
   WebSocketError* = object of IOError
   WebSocketClosedError* = object of WebSocketError
@@ -44,6 +49,8 @@ type
   WebSocketFrameProtocolError* = object of WebSocketError
   WebSocketReadTimeoutError* = object of WebSocketClosedError
   WebSocketHeartbeatTimeoutError* = object of WebSocketClosedError
+  WebSocketWriteTimeoutError* = object of WebSocketClosedError
+  WebSocketSendQueueFullError* = object of WebSocketError
 
 # -----------------------------------------------------------------------------
 # Limit one complete frame read. A timeout terminates the connection because
@@ -84,6 +91,31 @@ proc terminateTimedOutSocket(ws: WebSocket) =
   ws.stopPings()
   if not ws.tcpSocket.isClosed:
     ws.tcpSocket.close()
+
+# -----------------------------------------------------------------------------
+# Bound total queued writes (including the active write) per connection.
+# A finite cap prevents slow readers from consuming unbounded application RAM.
+# -----------------------------------------------------------------------------
+proc setSendLimits*(ws: WebSocket, pendingBytes: int) =
+  if pendingBytes <= 0:
+    raise newException(ValueError, "WebSocket send limit must be positive")
+  ws.maxPendingSendBytes = pendingBytes
+
+# -----------------------------------------------------------------------------
+# Set a deadline for one complete frame write, starting when it acquires the
+# write queue. Zero disables the deadline for backwards compatibility.
+# -----------------------------------------------------------------------------
+proc setWriteTimeout*(ws: WebSocket, milliseconds: int) =
+  if milliseconds < 0:
+    raise newException(ValueError, "WebSocket write timeout must be nonnegative")
+  ws.writeTimeoutMs = milliseconds
+
+# -----------------------------------------------------------------------------
+# Expose the number of bytes currently reserved for queued/active frames.
+# This is an accounting limit, not a copy of the pending payloads.
+# -----------------------------------------------------------------------------
+proc pendingSendBytes*(ws: WebSocket): int =
+  ws.queuedWriteBytes
 
 # -----------------------------------------------------------------------------
 # Set independent receive limits; call before starting the receive loop.
@@ -379,40 +411,99 @@ proc encodeFrame(f: Frame): string =
   ret.setPosition(0)
   return ret.readAll()
 
-proc send*(
-  ws: WebSocket, text: string, opcode = Opcode.Text
-): Future[void] {.async.} =
-  ## This is the main method used to send data via this WebSocket.
-  if ws.readyState != Open:
-    # Ignore calls to send on a closed socket.
-    return
-  try:
-    var frame = encodeFrame((
-      fin: true,
-      rsv1: false,
-      rsv2: false,
-      rsv3: false,
-      opcode: opcode,
-      mask: ws.masked,
-      data: text
-    ))
-    const maxSize = 1024*1024
-    # Send stuff in 1 megabyte chunks to prevent IOErrors.
-    # This really large packets.
-    var i = 0
-    while i < frame.len:
-      let data = frame[i ..< min(frame.len, i + maxSize)]
-      await ws.tcpSocket.send(data)
-      i += maxSize
-      await sleepAsync(1)
-  except Defect, IOError, OSError, ValueError:
-    # Don't throw exceptions just close the socket.
-    ws.readyState = Closed
-    ws.stopPings()
+# -----------------------------------------------------------------------------
+# Write one encoded frame in bounded chunks. A whole frame is serialized;
+# splitting it into TCP writes must not interleave another WebSocket frame.
+# -----------------------------------------------------------------------------
+proc writeEncodedFrame(ws: WebSocket, frame: string): Future[void] {.async.} =
+  const writeChunk = 64 * 1024
+  var offset = 0
+  while offset < frame.len:
+    let untilIndex = min(frame.len, offset + writeChunk)
+    await ws.tcpSocket.send(frame[offset ..< untilIndex])
+    offset = untilIndex
 
 # -----------------------------------------------------------------------------
-# Send a single Close control frame before changing the socket lifecycle.
-# This does not close the underlying AsyncSocket: an HTTP transport may own it.
+# Observe a socket write which was abandoned after its deadline. Closing the
+# AsyncSocket is required: withTimeout() by itself does not cancel the send.
+# -----------------------------------------------------------------------------
+proc observeTimedOutWrite(writeFuture: Future[void]) =
+  try:
+    writeFuture.read()
+  except CatchableError:
+    discard
+
+# -----------------------------------------------------------------------------
+# Serialize all outbound frames, including Close, with a Future baton.
+# Install the baton and reserve queue capacity before the first await.
+# The baton completes in finally so a failed write cannot strand successors.
+# -----------------------------------------------------------------------------
+proc queueFrame(ws: WebSocket, opcode: Opcode, payload: string,
+                closeFrame = false): Future[void] {.async.} =
+  if payload.len > high(int) - 14:
+    raise newException(WebSocketSendQueueFullError, "WebSocket send size overflow")
+
+  let charge = payload.len + 14 # worst-case frame header and mask overhead
+  let limit = if ws.maxPendingSendBytes > 0:
+    ws.maxPendingSendBytes
+  else:
+    DefaultMaxPendingSendBytes
+
+  if not closeFrame and (charge > limit or ws.queuedWriteBytes > limit - charge):
+    raise newException(WebSocketSendQueueFullError,
+      "WebSocket pending send limit exceeded")
+
+  let previous = ws.writeTail
+  let turn = newFuture[void]("ws.queueFrame")
+  ws.writeTail = turn
+  ws.queuedWriteBytes += charge
+
+  try:
+    if not previous.isNil:
+      await previous
+    if ws.readyState == Closed or ws.tcpSocket.isClosed:
+      raise newWebSocketClosedError()
+
+    let frame = encodeFrame((
+      fin: true, rsv1: false, rsv2: false, rsv3: false,
+      opcode: opcode, mask: ws.masked, data: payload
+    ))
+    let writeFuture = ws.writeEncodedFrame(frame)
+    if ws.writeTimeoutMs > 0:
+      if not (await withTimeout(writeFuture, ws.writeTimeoutMs)):
+        writeFuture.addCallback(proc () = observeTimedOutWrite(writeFuture))
+        raise newException(WebSocketWriteTimeoutError,
+          "WebSocket frame write deadline expired")
+    await writeFuture
+  except CatchableError:
+    ws.readyState = Closed
+    ws.stopPings()
+    # A partial frame makes the stream unusable. Closing also releases a
+    # pending asyncnet.send() without leaving it writing on another session.
+    if not ws.tcpSocket.isClosed:
+      ws.tcpSocket.close()
+    raise
+  finally:
+    ws.queuedWriteBytes -= charge
+    if ws.writeTail == turn:
+      ws.writeTail = nil
+    if not turn.finished:
+      turn.complete()
+
+# -----------------------------------------------------------------------------
+# Send one data/control frame in queue order. Calls after Close are ignored
+# for compatibility; calls already queued before Close finish before it.
+# -----------------------------------------------------------------------------
+proc send*(ws: WebSocket, text: string,
+           opcode = Opcode.Text): Future[void] {.async.} =
+  if ws.readyState != Open:
+    return
+  await ws.queueFrame(opcode, text)
+
+# -----------------------------------------------------------------------------
+# Queue Close after any previously accepted data frames. The state changes
+# before awaiting so subsequent application sends cannot overtake Close.
+# The socket remains owned by the HTTP transport or caller.
 # -----------------------------------------------------------------------------
 proc sendCloseFrame(ws: WebSocket, payload: string): Future[void] {.async.} =
   if ws.readyState != Open:
@@ -420,17 +511,9 @@ proc sendCloseFrame(ws: WebSocket, payload: string): Future[void] {.async.} =
   if payload.len > 125:
     raise newException(WebSocketError, "Close payload exceeds 125 bytes")
 
-  let frame = encodeFrame((
-    fin: true, rsv1: false, rsv2: false, rsv3: false,
-    opcode: Opcode.Close, mask: ws.masked, data: payload
-  ))
   ws.readyState = Closing
   ws.stopPings()
-  try:
-    await ws.tcpSocket.send(frame)
-  except CatchableError:
-    ws.readyState = Closed
-    raise
+  await ws.queueFrame(Opcode.Close, payload, closeFrame = true)
 
 # -----------------------------------------------------------------------------
 # Begin an orderly Close handshake. The caller must await the peer's Close
