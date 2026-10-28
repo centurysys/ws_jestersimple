@@ -1,5 +1,5 @@
 import asyncdispatch, asynchttpserver, asyncnet, base64, httpclient, httpcore,
-    nativesockets, net, random, std/sha1, streams, strformat, strutils, uri
+    nativesockets, net, random, std/sha1, std/monotimes, streams, strformat, strutils, uri
 
 # Receive limits are per WebSocket. Defaults keep untrusted input bounded even
 # when a WebSocket is constructed directly rather than via newWebSocket().
@@ -23,6 +23,13 @@ type
     masked*: bool # send masked packets
     maxFrameBytes: int
     maxMessageBytes: int
+    readTimeoutMs: int
+    heartbeatTimeoutMs: int
+    heartbeatPending: bool
+    heartbeatPayload: string
+    heartbeatSentTicks: int64
+    heartbeatExpired: bool
+    pingGeneration: uint64
 
   WebSocketError* = object of IOError
   WebSocketClosedError* = object of WebSocketError
@@ -35,6 +42,48 @@ type
   WebSocketFrameTooLargeError* = object of WebSocketError
   WebSocketMessageTooLargeError* = object of WebSocketError
   WebSocketFrameProtocolError* = object of WebSocketError
+  WebSocketReadTimeoutError* = object of WebSocketClosedError
+  WebSocketHeartbeatTimeoutError* = object of WebSocketClosedError
+
+# -----------------------------------------------------------------------------
+# Limit one complete frame read. A timeout terminates the connection because
+# asyncdispatch.withTimeout does not cancel a pending AsyncSocket.recv().
+# Zero disables the limit; timeouts are opt-in for compatibility.
+# -----------------------------------------------------------------------------
+proc setReadTimeout*(ws: WebSocket, milliseconds: int) =
+  if milliseconds < 0:
+    raise newException(ValueError, "WebSocket read timeout must be nonnegative")
+  ws.readTimeoutMs = milliseconds
+
+# -----------------------------------------------------------------------------
+# Set the deadline for an unanswered periodic Ping. Only setupPings-generated
+# Pings participate; zero disables Pong enforcement (legacy behavior).
+# -----------------------------------------------------------------------------
+proc setHeartbeatTimeout*(ws: WebSocket, milliseconds: int) =
+  if milliseconds < 0:
+    raise newException(ValueError, "WebSocket heartbeat timeout must be nonnegative")
+  ws.heartbeatTimeoutMs = milliseconds
+  ws.heartbeatPending = false
+  ws.heartbeatPayload.setLen(0)
+
+# -----------------------------------------------------------------------------
+# Stop/revoke a periodic ping loop. The pending timer exits within 250 ms;
+# there is no detached socket reader or per-Ping timer to leak.
+# -----------------------------------------------------------------------------
+proc stopPings*(ws: WebSocket) =
+  inc ws.pingGeneration
+  ws.heartbeatPending = false
+  ws.heartbeatPayload.setLen(0)
+
+# -----------------------------------------------------------------------------
+# Terminate a timed-out socket so a pending recv() cannot consume future data.
+# Jester Simple's HTTP transport checks isClosed before its final close.
+# -----------------------------------------------------------------------------
+proc terminateTimedOutSocket(ws: WebSocket) =
+  ws.readyState = Closed
+  ws.stopPings()
+  if not ws.tcpSocket.isClosed:
+    ws.tcpSocket.close()
 
 # -----------------------------------------------------------------------------
 # Set independent receive limits; call before starting the receive loop.
@@ -59,6 +108,15 @@ proc messageLimit(ws: WebSocket): int =
 
 func newWebSocketClosedError(): auto =
   newException(WebSocketClosedError, "Socket closed")
+
+# -----------------------------------------------------------------------------
+# Surface heartbeat timeout distinctly when its watchdog closed the socket.
+# -----------------------------------------------------------------------------
+proc raiseReadClosed(ws: WebSocket) =
+  if ws.heartbeatExpired:
+    raise newException(WebSocketHeartbeatTimeoutError,
+      "WebSocket Pong deadline expired")
+  raise newWebSocketClosedError()
 
 template `[]`(value: uint8, index: int): bool =
   ## Get bits from uint8, uint8[2] gets 2nd bit.
@@ -350,6 +408,7 @@ proc send*(
   except Defect, IOError, OSError, ValueError:
     # Don't throw exceptions just close the socket.
     ws.readyState = Closed
+    ws.stopPings()
 
 # -----------------------------------------------------------------------------
 # Send a single Close control frame before changing the socket lifecycle.
@@ -366,6 +425,7 @@ proc sendCloseFrame(ws: WebSocket, payload: string): Future[void] {.async.} =
     opcode: Opcode.Close, mask: ws.masked, data: payload
   ))
   ws.readyState = Closing
+  ws.stopPings()
   try:
     await ws.tcpSocket.send(frame)
   except CatchableError:
@@ -398,10 +458,12 @@ proc recvExact(ws: WebSocket, count: int): Future[string] {.async.} =
       data = await ws.tcpSocket.recv(min(remaining, readChunk))
     except IOError, OSError:
       ws.readyState = Closed
-      raise newWebSocketClosedError()
+      ws.stopPings()
+      ws.raiseReadClosed()
     if data.len == 0:
       ws.readyState = Closed
-      raise newWebSocketClosedError()
+      ws.stopPings()
+      ws.raiseReadClosed()
     result.add(data)
 
 # -----------------------------------------------------------------------------
@@ -410,6 +472,7 @@ proc recvExact(ws: WebSocket, count: int): Future[string] {.async.} =
 # -----------------------------------------------------------------------------
 proc failProtocol(ws: WebSocket, message: string) =
   ws.readyState = Closed
+  ws.stopPings()
   raise newException(WebSocketFrameProtocolError, message)
 
 # -----------------------------------------------------------------------------
@@ -484,9 +547,10 @@ proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
   ## Gets a frame from the WebSocket.
   ## See https://tools.ietf.org/html/rfc6455#section-5.2
 
-  if cast[int](ws.tcpSocket.getFd) == -1:
+  if ws.tcpSocket.isClosed:
     ws.readyState = Closed
-    raise newWebSocketClosedError()
+    ws.stopPings()
+    ws.raiseReadClosed()
 
   # TCP is a byte stream: each frame field can arrive in several reads.
   let header = await ws.recvExact(2)
@@ -575,9 +639,32 @@ proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
     ws.failProtocol("Invalid Close status code or UTF-8 reason")
 
 # -----------------------------------------------------------------------------
-# Receive a complete message, allowing control frames between fragments.
-# Ping/Pong outside a fragmented message are returned for API compatibility;
-# interleaved Ping is answered here so a fragmented message can complete.
+# Observe a timed-out read after closing its socket. withTimeout() alone does
+# not cancel the Future; this callback consumes its eventual result/exception.
+# -----------------------------------------------------------------------------
+proc observeTimedOutRead(readFuture: Future[Frame]) =
+  try:
+    discard readFuture.read()
+  except CatchableError:
+    discard
+
+# -----------------------------------------------------------------------------
+# Read the next frame under an optional per-frame deadline. On expiry, close
+# the connection to prevent the abandoned Future from reading another frame.
+# -----------------------------------------------------------------------------
+proc readFrameWithDeadline(ws: WebSocket, remaining: int):
+    Future[Frame] {.async.} =
+  let readFuture = ws.recvFrame(remaining)
+  if ws.readTimeoutMs > 0:
+    if not (await withTimeout(readFuture, ws.readTimeoutMs)):
+      readFuture.addCallback(proc () = observeTimedOutRead(readFuture))
+      ws.terminateTimedOutSocket()
+      raise newException(WebSocketReadTimeoutError,
+        "WebSocket frame read deadline expired")
+  return await readFuture
+
+# -----------------------------------------------------------------------------
+# Receive a complete data message, exposing non-fragmented control frames.
 # -----------------------------------------------------------------------------
 proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
   let limit = ws.messageLimit()
@@ -587,13 +674,14 @@ proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
 
   while true:
     let remaining = if fragmented: limit - message.len else: limit
-    let frame = await ws.recvFrame(remaining)
+    let frame = await ws.readFrameWithDeadline(remaining)
 
     case frame.opcode
     of Close:
       if ws.readyState == Open:
         await ws.sendCloseFrame(frame.data)
       ws.readyState = Closed
+      ws.stopPings()
       return (Close, frame.data)
 
     of Ping:
@@ -605,6 +693,8 @@ proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
       return (Ping, frame.data)
 
     of Pong:
+      if ws.heartbeatPending and frame.data == ws.heartbeatPayload:
+        ws.heartbeatPending = false
       if fragmented:
         continue
       return (Pong, frame.data)
@@ -629,66 +719,131 @@ proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
       messageOpcode = frame.opcode
       message = frame.data
 
+# -----------------------------------------------------------------------------
+# Ignore control frames while awaiting a Text packet; answer each Ping once.
+# The public receivePacket API continues to expose Ping/Pong to its callers.
+# -----------------------------------------------------------------------------
 proc receiveStrPacket*(ws: WebSocket): Future[string] {.async.} =
-  ## Wait only for a string packet to come. Errors out on Binary packets.
-  let (opcode, data) = await ws.receivePacket()
-  case opcode:
+  while true:
+    let (opcode, data) = await ws.receivePacket()
+    case opcode
     of Text:
       return data
     of Binary:
-      raise newException(
-        WebSocketPacketTypeError,
-        "Expected string packet, received binary packet"
-      )
+      raise newException(WebSocketPacketTypeError,
+        "Expected string packet, received binary packet")
     of Ping:
       await ws.send(data, Pong)
+      if ws.readyState != Open:
+        ws.raiseReadClosed()
     of Pong:
       discard
-    of Cont:
-      discard
     of Close:
-      ws.readyState = Closed
-      raise newWebSocketClosedError()
+      ws.raiseReadClosed()
+    of Cont:
+      ws.failProtocol("Unexpected continuation packet")
 
+# -----------------------------------------------------------------------------
+# Ignore control frames while awaiting a Binary packet; answer each Ping once.
+# -----------------------------------------------------------------------------
 proc receiveBinaryPacket*(ws: WebSocket): Future[seq[byte]] {.async.} =
-  ## Wait only for a binary packet to come. Errors out on string packets.
-  let (opcode, data) = await ws.receivePacket()
-  case opcode:
-    of Text:
-      raise newException(
-        WebSocketPacketTypeError,
-        "Expected binary packet, received string packet"
-      )
+  while true:
+    let (opcode, data) = await ws.receivePacket()
+    case opcode
     of Binary:
       return cast[seq[byte]](data)
+    of Text:
+      raise newException(WebSocketPacketTypeError,
+        "Expected binary packet, received string packet")
     of Ping:
       await ws.send(data, Pong)
+      if ws.readyState != Open:
+        ws.raiseReadClosed()
     of Pong:
       discard
-    of Cont:
-      discard
     of Close:
-      ws.readyState = Closed
-      raise newWebSocketClosedError()
+      ws.raiseReadClosed()
+    of Cont:
+      ws.failProtocol("Unexpected continuation packet")
 
+# -----------------------------------------------------------------------------
+# Send a valid Ping control frame with a bounded payload.
+# -----------------------------------------------------------------------------
 proc ping*(ws: WebSocket, data = "") {.async.} =
-  ## Sends a ping to the other end, both server and client can send a ping.
-  ## Data is optional.
+  if data.len > 125:
+    raise newException(ValueError, "WebSocket Ping payload exceeds 125 bytes")
   await ws.send(data, Ping)
 
+# -----------------------------------------------------------------------------
+# Start periodic Pings. Repeated calls replace the old loop; stopPings() or
+# closing the connection ends the task within 250 ms. Optional Pong deadlines
+# require an active receive loop to process matching Pong frames.
+# -----------------------------------------------------------------------------
 proc setupPings*(ws: WebSocket, seconds: float) =
-  ## Sets a delay on when to send pings.
+  if not (seconds > 0.0) or seconds > float(high(int) div 1000):
+    raise newException(ValueError, "Invalid WebSocket Ping interval")
+  if ws.readyState != Open:
+    raise newException(ValueError, "WebSocket must be Open for periodic Pings")
+
+  let intervalMs = max(1, int(seconds * 1000.0))
+  ws.stopPings()
+  ws.heartbeatExpired = false
+  let generation = ws.pingGeneration
+  const nanosPerMs = 1_000_000'i64
+
   proc pingLoop() {.async.} =
-    while ws.readyState != Closed:
-      await ws.ping()
-      await sleepAsync(1000 * seconds)
+    var nextPingTicks = getMonoTime().ticks + int64(intervalMs) * nanosPerMs
+    try:
+      while ws.readyState == Open and ws.pingGeneration == generation:
+        let now = getMonoTime().ticks
+        if ws.heartbeatPending and ws.heartbeatTimeoutMs > 0 and
+            now - ws.heartbeatSentTicks >=
+              int64(ws.heartbeatTimeoutMs) * nanosPerMs:
+          ws.heartbeatExpired = true
+          ws.terminateTimedOutSocket()
+          break
+
+        if now >= nextPingTicks:
+          nextPingTicks = now + int64(intervalMs) * nanosPerMs
+          if not ws.heartbeatPending or ws.heartbeatTimeoutMs == 0:
+            let payload = $now
+            # Arm the Pong waiter before the first await: a fast peer can
+            # reply while send() is suspended after writing the Ping.
+            if ws.heartbeatTimeoutMs > 0:
+              ws.heartbeatPayload = payload
+              ws.heartbeatSentTicks = getMonoTime().ticks
+              ws.heartbeatPending = true
+            await ws.ping(payload)
+            if ws.readyState != Open or ws.pingGeneration != generation:
+              break
+
+        let nowAfter = getMonoTime().ticks
+        var delayMs = max(1'i64,
+          (nextPingTicks - nowAfter + nanosPerMs - 1) div nanosPerMs)
+        if ws.heartbeatPending and ws.heartbeatTimeoutMs > 0:
+          let deadline = ws.heartbeatSentTicks +
+            int64(ws.heartbeatTimeoutMs) * nanosPerMs
+          let remaining = max(1'i64,
+            (deadline - nowAfter + nanosPerMs - 1) div nanosPerMs)
+          delayMs = min(delayMs, remaining)
+        await sleepAsync(int(min(250'i64, delayMs)))
+    except CatchableError:
+      # Do not terminate a connection after this task was superseded/stopped.
+      if ws.readyState == Open and ws.pingGeneration == generation:
+        try:
+          ws.terminateTimedOutSocket()
+        except CatchableError:
+          discard
+
   asyncCheck pingLoop()
 
 proc hangup*(ws: WebSocket) =
   ## Closes the Socket without sending a close packet.
   ws.readyState = Closed
+  ws.stopPings()
   try:
-    ws.tcpSocket.close()
+    if not ws.tcpSocket.isClosed:
+      ws.tcpSocket.close()
   except:
     raise newException(
       WebSocketError,
