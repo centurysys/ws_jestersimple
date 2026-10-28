@@ -135,7 +135,7 @@ def test_split_extended16(port):
 
 def test_split_extended64(port):
     # The RFC-minimal length-127 encoding starts at 65536 bytes.
-    payload = bytes(range(256)) * 256
+    payload = b"S" * 65536
     echo_once(port, payload, list(range(1, 17)) +
               [32, 160, 4096, 16384, 32768, 49152])
 

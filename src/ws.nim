@@ -34,6 +34,7 @@ type
   WebSocketFrameLengthError* = object of WebSocketError
   WebSocketFrameTooLargeError* = object of WebSocketError
   WebSocketMessageTooLargeError* = object of WebSocketError
+  WebSocketFrameProtocolError* = object of WebSocketError
 
 # -----------------------------------------------------------------------------
 # Set independent receive limits; call before starting the receive loop.
@@ -403,6 +404,81 @@ proc recvExact(ws: WebSocket, count: int): Future[string] {.async.} =
       raise newWebSocketClosedError()
     result.add(data)
 
+# -----------------------------------------------------------------------------
+# Reject malformed framing before converting untrusted opcode values to enums.
+# The caller/transport owns the socket and is responsible for closing it.
+# -----------------------------------------------------------------------------
+proc failProtocol(ws: WebSocket, message: string) =
+  ws.readyState = Closed
+  raise newException(WebSocketFrameProtocolError, message)
+
+# -----------------------------------------------------------------------------
+# Check RFC 3629 UTF-8 without accepting overlong encodings or surrogates.
+# Validate complete messages, not individual fragmented UTF-8 frame payloads.
+# -----------------------------------------------------------------------------
+func validUtf8(data: string): bool =
+  var i = 0
+  while i < data.len:
+    let first = data[i].uint8
+    var follows = 0
+    var secondMin = 0x80'u8
+    var secondMax = 0xbf'u8
+
+    case first
+    of 0x00'u8..0x7f'u8:
+      inc i
+      continue
+    of 0xc2'u8..0xdf'u8:
+      follows = 1
+    of 0xe0'u8:
+      follows = 2
+      secondMin = 0xa0'u8
+    of 0xe1'u8..0xec'u8, 0xee'u8..0xef'u8:
+      follows = 2
+    of 0xed'u8:
+      follows = 2
+      secondMax = 0x9f'u8
+    of 0xf0'u8:
+      follows = 3
+      secondMin = 0x90'u8
+    of 0xf1'u8..0xf3'u8:
+      follows = 3
+    of 0xf4'u8:
+      follows = 3
+      secondMax = 0x8f'u8
+    else:
+      return false
+
+    if data.len - i <= follows:
+      return false
+    let second = data[i + 1].uint8
+    if second < secondMin or second > secondMax:
+      return false
+    for offset in 2..follows:
+      let value = data[i + offset].uint8
+      if value < 0x80'u8 or value > 0xbf'u8:
+        return false
+    i += follows + 1
+  return true
+
+# -----------------------------------------------------------------------------
+# Close control frames contain zero bytes or a valid status code and UTF-8.
+# Extensions and reserved status codes are not negotiated by this library.
+# -----------------------------------------------------------------------------
+func validClosePayload(payload: string): bool =
+  if payload.len == 0:
+    return true
+  if payload.len == 1:
+    return false
+  let code = (int(payload[0].uint8) shl 8) or int(payload[1].uint8)
+  if code < 1000 or code >= 5000 or code in [1004, 1005, 1006, 1015]:
+    return false
+  if code > 1014 and code < 3000:
+    return false
+  if payload.len == 2:
+    return true
+  return validUtf8(payload[2..^1])
+
 proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
     Future[Frame] {.async.} =
   ## Gets a frame from the WebSocket.
@@ -418,17 +494,31 @@ proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
   let b0 = header[0].uint8
   let b1 = header[1].uint8
 
-  # Read the flags and fin from the header.
+  # Do not enum-cast reserved opcode values: they may trigger RangeDefect.
   result.fin = b0[0]
   result.rsv1 = b0[1]
   result.rsv2 = b0[2]
   result.rsv3 = b0[3]
-  result.opcode = (b0 and 0x0f).Opcode
-
-  # If any of the rsv are set close the socket.
   if result.rsv1 or result.rsv2 or result.rsv3:
-    ws.readyState = Closed
-    raise newException(WebSocketError, "WebSocket rsv mismatch")
+    ws.failProtocol("Unexpected RSV bit (no extensions negotiated)")
+
+  let rawOpcode = b0 and 0x0f'u8
+  case rawOpcode
+  of 0x0'u8, 0x1'u8, 0x2'u8, 0x8'u8, 0x9'u8, 0xa'u8:
+    result.opcode = Opcode(rawOpcode)
+  else:
+    ws.failProtocol("Reserved WebSocket opcode")
+
+  let isControl = rawOpcode >= 0x8'u8
+  # An extended length is always illegal for a control frame. Reject it
+  # before waiting for the extra bytes or allocating a payload buffer.
+  if isControl and (not result.fin or (b1 and 0x7f'u8) > 125'u8):
+    ws.failProtocol("Invalid control frame FIN or length")
+
+  # Client frames must be masked; server frames must not be masked.
+  result.mask = (b1 and 0x80'u8) != 0'u8
+  if ws.masked == result.mask:
+    ws.failProtocol("Unexpected WebSocket MASK bit")
 
   # Decode the full 64-bit network-order length without pointer casts.
   # Reject invalid and oversized lengths before reading a mask or payload.
@@ -462,19 +552,11 @@ proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
     ws.readyState = Closed
     raise newException(WebSocketFrameTooLargeError,
       "WebSocket frame exceeds receive limit")
-  if remainingMessageBytes < 0 or
-      payloadLen > uint64(remainingMessageBytes):
+  if not isControl and (remainingMessageBytes < 0 or
+      payloadLen > uint64(remainingMessageBytes)):
     ws.readyState = Closed
     raise newException(WebSocketMessageTooLargeError,
       "WebSocket message exceeds receive limit")
-
-  # Do we need to apply mask?
-  result.mask = (b1 and 0x80) == 0x80
-
-  if ws.masked == result.mask:
-    # Server sends unmasked but accepts only masked.
-    # Client sends masked but accepts only unmasked.
-    raise newException(WebSocketError, "Socket mask mismatch")
 
   var maskKey = ""
   if result.mask:
@@ -485,35 +567,67 @@ proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
   result.data = await ws.recvExact(int(payloadLen))
 
   if result.mask:
-    # Apply mask, if we need too.
+    # Apply the masking key after all payload bytes have arrived.
     for i in 0 ..< result.data.len:
       result.data[i] = (result.data[i].uint8 xor maskKey[i mod 4].uint8).char
 
-proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
-  ## Wait for a string or binary packet to come in.
-  let limit = ws.messageLimit()
-  var frame = await ws.recvFrame(limit)
-  result[0] = frame.opcode
-  result[1] = frame.data
-  # Enforce the aggregate limit before appending each continuation frame.
-  while not frame.fin:
-    frame = await ws.recvFrame(limit - result[1].len)
-    if frame.opcode != Cont:
-      ws.readyState = Closed
-      raise newWebSocketClosedError()
-    if frame.data.len > limit - result[1].len:
-      ws.readyState = Closed
-      raise newException(WebSocketMessageTooLargeError,
-        "WebSocket fragmented message exceeds receive limit")
-    result[1].add(frame.data)
+  if result.opcode == Close and not validClosePayload(result.data):
+    ws.failProtocol("Invalid Close status code or UTF-8 reason")
 
-  # Peer-initiated Close requires a Close response, not just a TCP teardown.
-  # If we initiated the handshake, the incoming Close is the acknowledgement.
-  if result[0] == Close:
-    if ws.readyState == Open:
-      await ws.sendCloseFrame(result[1])
-    ws.readyState = Closed
-  return
+# -----------------------------------------------------------------------------
+# Receive a complete message, allowing control frames between fragments.
+# Ping/Pong outside a fragmented message are returned for API compatibility;
+# interleaved Ping is answered here so a fragmented message can complete.
+# -----------------------------------------------------------------------------
+proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
+  let limit = ws.messageLimit()
+  var fragmented = false
+  var messageOpcode = Text
+  var message = ""
+
+  while true:
+    let remaining = if fragmented: limit - message.len else: limit
+    let frame = await ws.recvFrame(remaining)
+
+    case frame.opcode
+    of Close:
+      if ws.readyState == Open:
+        await ws.sendCloseFrame(frame.data)
+      ws.readyState = Closed
+      return (Close, frame.data)
+
+    of Ping:
+      if fragmented:
+        await ws.send(frame.data, Pong)
+        if ws.readyState != Open:
+          raise newWebSocketClosedError()
+        continue
+      return (Ping, frame.data)
+
+    of Pong:
+      if fragmented:
+        continue
+      return (Pong, frame.data)
+
+    of Cont:
+      if not fragmented:
+        ws.failProtocol("Unexpected continuation frame")
+      message.add(frame.data)
+      if frame.fin:
+        if messageOpcode == Text and not validUtf8(message):
+          ws.failProtocol("Invalid UTF-8 text message")
+        return (messageOpcode, message)
+
+    of Text, Binary:
+      if fragmented:
+        ws.failProtocol("New data frame before fragmented message completed")
+      if frame.fin:
+        if frame.opcode == Text and not validUtf8(frame.data):
+          ws.failProtocol("Invalid UTF-8 text message")
+        return (frame.opcode, frame.data)
+      fragmented = true
+      messageOpcode = frame.opcode
+      message = frame.data
 
 proc receiveStrPacket*(ws: WebSocket): Future[string] {.async.} =
   ## Wait only for a string packet to come. Errors out on Binary packets.

@@ -148,24 +148,24 @@ def expect_rejection(port, path, wire, counter):
     assert after == tuple(expected), (counter, before, after)
 
 
-def echo(port, path, payload, fragments=None):
+def echo(port, path, payload, fragments=None, opcode=1):
     sock, carry = upgrade(port, path)
     with sock:
         if fragments is None:
-            sock.sendall(frame(payload))
+            sock.sendall(frame(payload, opcode=opcode))
         else:
-            sock.sendall(b"".join(frame(part, opcode=1 if i == 0 else 0,
+            sock.sendall(b"".join(frame(part, opcode=opcode if i == 0 else 0,
                                        fin=i == len(fragments) - 1)
                                   for i, part in enumerate(fragments)))
-        opcode, response, carry = recv_frame(sock, carry)
-        assert (opcode, response) == (1, payload), (opcode, len(response))
+        response_opcode, response, carry = recv_frame(sock, carry)
+        assert (response_opcode, response) == (opcode, payload), (response_opcode, len(response))
         close_cleanly(sock, carry)
 
 
 def test_7_16_64_boundaries(port):
     for size in (0, 125, 126, 65535, 65536):
         echo(port, "/echo", bytes(range(256)) * (size // 256) +
-             bytes(range(size % 256)))
+             bytes(range(size % 256)), opcode=2)
 
 
 def test_default_frame_limit(port):
