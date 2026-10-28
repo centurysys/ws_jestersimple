@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, ws_jestersimple
 
 proc cb(req: Request) {.async.} =
   if req.url.path == "/ws":

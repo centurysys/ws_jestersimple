@@ -1,5 +1,5 @@
 import asyncdispatch, asynchttpserver, base64, jester, jester/private/utils,
-    nativesockets, std/sha1, strutils, ws
+    nativesockets, std/sha1, strutils, ws_jestersimple
 
 when useHttpBeast:
   import httpbeast, options, asyncnet

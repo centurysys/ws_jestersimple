@@ -1,4 +1,4 @@
-import asyncdispatch, ws
+import asyncdispatch, ws_jestersimple
 
 proc socketIo() {.async.} =
   echo "Connecting..."

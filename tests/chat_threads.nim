@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, shared/seq, ws
+import asyncdispatch, asynchttpserver, shared/seq, ws_jestersimple
 
 # compile with --threads:on
 # Threading in nim is kind of hard

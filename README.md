@@ -1,14 +1,41 @@
+# ws_jestersimple
+
+This is the `ws_jestersimple` fork, derived from `treeform/ws` v0.6.0
+(MIT; copyright notices retained in `LICENSE`). Its Nimble package and public
+module names intentionally differ from upstream `ws` to prevent accidental
+mixing or upgrades. Initial fork release: `0.1.0`.
+
+- Nimble package: `ws_jestersimple` (requires Nim >= 2.2.12 and
+  `jestersimple >= 1.0.0`).
+- Main module: `import ws_jestersimple`.
+- Jester Simple adapter: `import ws_jestersimple/jestersimple_extra`.
+- Legacy Jester adapter (optional, requires `jester` separately):
+  `import ws_jestersimple/jester_extra`.
+- The WebSocket transport is owned by Jester Simple after Upgrade. Keep the
+  route Future alive for the full WebSocket session; do not detach it with
+  `asyncCheck` and return from the route.
+- Debug/Release integration tests:
+  `JS_ROOT=/path/to/jester_simple bash tests/packaging/run_ws03c.sh`.
+
+For local development run `nimble develop` in the `jester_simple` repository,
+then `nimble develop` in this repository. A checkout of upstream `ws` can
+coexist with this fork; import only the desired module.
+
+---
+
+## Original upstream documentation (adapted imports)
+
 <img src="docs/wsBanner.png">
 
 # Simple WebSocket library for nim.
 
-`nimble install ws`
+`nimble develop` (from this checkout)
 
 ![Github Actions](https://github.com/treeform/ws/workflows/Github%20Actions/badge.svg)
 
 [API reference](https://treeform.github.io/ws)
 
-This library has no dependencies other than the Nim standard library.
+Unlike upstream, this fork declares a Jester Simple dependency for its adapter.
 
 ## About
 
@@ -20,7 +47,7 @@ This was originally based on the work by niv https://github.com/niv/websocket.ni
 
 This library is being actively developed and we'd be happy for you to use it.
 
-`nimble install ws`
+`nimble develop` (from this checkout)
 
 ![Github Actions](https://github.com/treeform/ws/workflows/Github%20Actions/badge.svg)
 
@@ -42,7 +69,7 @@ API reference: https://treeform.github.io/ws/
 Example echo server, will repeat what you send it:
 
 ```nim
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, 
 
 var connections = newSeq[WebSocket]()
 
@@ -85,7 +112,7 @@ ws.send("hi")
 Example chat server, will send what you send to connected all clients.
 
 ```nim
-import ws, asyncdispatch, asynchttpserver
+import , asyncdispatch, asynchttpserver
 
 var connections = newSeq[WebSocket]()
 
@@ -128,7 +155,7 @@ ws.send("Good, you?")
 Instead of being the server you are the client connecting to some other server:
 
 ```nim
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, 
 
 proc main() {.async.} =
   var ws = await newWebSocket("ws://127.0.0.1:9001/ws")
@@ -152,11 +179,11 @@ var ws = await newWebsocket("wss://echo.websocket.org", protocol = "alpha")
 
 ## Using with Jester
 
-If you use using `ws` with `jester` library you need to import jester_extra:
+The optional legacy `jester` adapter is retained separately, but requires `jester` to be installed:
 
 ```nim
 import jester
-import ws, ws/jester_extra
+import ws_jestersimple, ws_jestersimple/jester_extra
 
 routes:
   get "/ws":
