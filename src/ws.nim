@@ -318,6 +318,34 @@ proc send*(
     # Don't throw exceptions just close the socket.
     ws.readyState = Closed
 
+# -----------------------------------------------------------------------------
+# Send a single Close control frame before changing the socket lifecycle.
+# This does not close the underlying AsyncSocket: an HTTP transport may own it.
+# -----------------------------------------------------------------------------
+proc sendCloseFrame(ws: WebSocket, payload: string): Future[void] {.async.} =
+  if ws.readyState != Open:
+    return
+  if payload.len > 125:
+    raise newException(WebSocketError, "Close payload exceeds 125 bytes")
+
+  let frame = encodeFrame((
+    fin: true, rsv1: false, rsv2: false, rsv3: false,
+    opcode: Opcode.Close, mask: ws.masked, data: payload
+  ))
+  ws.readyState = Closing
+  try:
+    await ws.tcpSocket.send(frame)
+  except CatchableError:
+    ws.readyState = Closed
+    raise
+
+# -----------------------------------------------------------------------------
+# Begin an orderly Close handshake. The caller must await the peer's Close
+# response (normally via receivePacket) and release its own socket afterward.
+# -----------------------------------------------------------------------------
+proc closeAsync*(ws: WebSocket): Future[void] {.async.} =
+  await ws.sendCloseFrame("")
+
 proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
   ## Gets a frame from the WebSocket.
   ## See https://tools.ietf.org/html/rfc6455#section-5.2
@@ -410,6 +438,13 @@ proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
     if frame.opcode != Cont:
       raise newWebSocketClosedError()
     result[1].add frame.data
+
+  # Peer-initiated Close requires a Close response, not just a TCP teardown.
+  # If we initiated the handshake, the incoming Close is the acknowledgement.
+  if result[0] == Close:
+    if ws.readyState == Open:
+      await ws.sendCloseFrame(result[1])
+    ws.readyState = Closed
   return
 
 proc receiveStrPacket*(ws: WebSocket): Future[string] {.async.} =
@@ -478,10 +513,22 @@ proc hangup*(ws: WebSocket) =
       "Failed to hangup socket " & getCurrentExceptionMsg()
     )
 
+# -----------------------------------------------------------------------------
+# Legacy fire-and-forget Close. Existing direct-socket users keep this API,
+# but transport-managed routes must use `await closeAsync()` instead.
+# -----------------------------------------------------------------------------
 proc close*(ws: WebSocket) =
-  ## Close the Socket, sends close packet.
-  ws.readyState = Closed
-  proc close() {.async.} =
-    await ws.send("", Close)
-    ws.tcpSocket.close()
-  asyncCheck close()
+  if ws.readyState != Open:
+    return
+  proc closeAndHangup() {.async.} =
+    try:
+      await ws.closeAsync()
+    except CatchableError:
+      discard
+    # Legacy close() tears down the FD; closeAsync leaves it to its owner.
+    try:
+      ws.tcpSocket.close()
+    except CatchableError:
+      discard
+    ws.readyState = Closed
+  asyncCheck closeAndHangup()

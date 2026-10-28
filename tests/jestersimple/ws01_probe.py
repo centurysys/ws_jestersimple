@@ -127,8 +127,8 @@ def test_echo(port):
             sock.sendall(client_frame(opcode, data))
             got_opcode, got_data, remain = read_frame(sock)
             assert (got_opcode, got_data, remain) == (opcode, data, b"")
-        # ws 0.6.0 currently does NOT send a Close response; WS-02a fixes it.
         sock.sendall(client_frame(8))
+        assert read_frame(sock)[:2] == (8, b"")
         assert_eof(sock)
 
 
@@ -139,6 +139,7 @@ def test_protocol(port):
         sock.sendall(client_frame(1, b"no-selection"))
         assert read_frame(sock)[:2] == (1, b"no-selection")
         sock.sendall(client_frame(8))
+        assert read_frame(sock)[:2] == (8, b"")
         assert_eof(sock)
 
     sock, fields = open_ws(port, "/ws-protocol", upgrade_headers("Sec-WebSocket-Protocol: superchat, chat"))
@@ -199,6 +200,7 @@ def test_fd_cycles(port, pid):
     for _ in range(20):
         with open_ws(port)[0] as sock:
             sock.sendall(client_frame(8))
+            assert read_frame(sock)[:2] == (8, b"")
             assert_eof(sock)
     deadline = time.monotonic() + 2.0
     while time.monotonic() < deadline and fd_count(pid) > baseline + 2:
