@@ -346,6 +346,31 @@ proc sendCloseFrame(ws: WebSocket, payload: string): Future[void] {.async.} =
 proc closeAsync*(ws: WebSocket): Future[void] {.async.} =
   await ws.sendCloseFrame("")
 
+# -----------------------------------------------------------------------------
+# Read an exact number of TCP bytes, regardless of recv() boundaries.
+# A zero-length read is successful without accessing the socket.
+# -----------------------------------------------------------------------------
+proc recvExact(ws: WebSocket, count: int): Future[string] {.async.} =
+  if count < 0:
+    raise newException(WebSocketError, "Negative WebSocket read length")
+  if count == 0:
+    return ""
+
+  const readChunk = 16 * 1024
+  result = newStringOfCap(min(count, readChunk))
+  while result.len < count:
+    let remaining = count - result.len
+    var data: string
+    try:
+      data = await ws.tcpSocket.recv(min(remaining, readChunk))
+    except IOError, OSError:
+      ws.readyState = Closed
+      raise newWebSocketClosedError()
+    if data.len == 0:
+      ws.readyState = Closed
+      raise newWebSocketClosedError()
+    result.add(data)
+
 proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
   ## Gets a frame from the WebSocket.
   ## See https://tools.ietf.org/html/rfc6455#section-5.2
@@ -354,16 +379,8 @@ proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
     ws.readyState = Closed
     raise newWebSocketClosedError()
 
-  # Grab the header.
-  var header: string
-  try:
-    header = await ws.tcpSocket.recv(2)
-  except:
-    raise newWebSocketClosedError()
-
-  if header.len != 2:
-    ws.readyState = Closed
-    raise newWebSocketClosedError()
+  # TCP is a byte stream: each frame field can arrive in several reads.
+  let header = await ws.recvExact(2)
 
   let b0 = header[0].uint8
   let b1 = header[1].uint8
@@ -386,16 +403,12 @@ proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
   let headerLen = uint(b1 and 0x7f)
   if headerLen == 0x7e:
     # Length must be 7+16 bits.
-    var length = await ws.tcpSocket.recv(2)
-    if length.len != 2:
-      raise newWebSocketClosedError()
+    var length = await ws.recvExact(2)
     finalLen = cast[ptr uint16](length[0].addr)[].htons
 
   elif headerLen == 0x7f:
     # Length must be 7+64 bits.
-    var length = await ws.tcpSocket.recv(8)
-    if length.len != 8:
-      raise newWebSocketClosedError()
+    var length = await ws.recvExact(8)
     finalLen = cast[ptr uint32](length[4].addr)[].htonl
 
   else:
@@ -413,14 +426,10 @@ proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
   var maskKey = ""
   if result.mask:
     # Read the mask.
-    maskKey = await ws.tcpSocket.recv(4)
-    if maskKey.len != 4:
-      raise newWebSocketClosedError()
+    maskKey = await ws.recvExact(4)
 
   # Read the data.
-  result.data = await ws.tcpSocket.recv(int finalLen)
-  if result.data.len != int finalLen:
-    raise newWebSocketClosedError()
+  result.data = await ws.recvExact(int(finalLen))
 
   if result.mask:
     # Apply mask, if we need too.
