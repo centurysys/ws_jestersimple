@@ -1,6 +1,12 @@
 import asyncdispatch, asynchttpserver, asyncnet, base64, httpclient, httpcore,
     nativesockets, net, random, std/sha1, streams, strformat, strutils, uri
 
+# Receive limits are per WebSocket. Defaults keep untrusted input bounded even
+# when a WebSocket is constructed directly rather than via newWebSocket().
+const
+  DefaultMaxFrameBytes* = 1024 * 1024
+  DefaultMaxMessageBytes* = 4 * 1024 * 1024
+
 type
   ReadyState* = enum
     Connecting = 0 # The connection is not yet open.
@@ -15,6 +21,8 @@ type
     protocol*: string
     readyState*: ReadyState
     masked*: bool # send masked packets
+    maxFrameBytes: int
+    maxMessageBytes: int
 
   WebSocketError* = object of IOError
   WebSocketClosedError* = object of WebSocketError
@@ -23,6 +31,30 @@ type
   WebSocketProtocolMismatchError* = object of WebSocketError
   WebSocketFailedUpgradeError* = object of WebSocketError
   WebSocketHandshakeError* = object of WebSocketError
+  WebSocketFrameLengthError* = object of WebSocketError
+  WebSocketFrameTooLargeError* = object of WebSocketError
+  WebSocketMessageTooLargeError* = object of WebSocketError
+
+# -----------------------------------------------------------------------------
+# Set independent receive limits; call before starting the receive loop.
+# Zero-initialized WebSockets use conservative defaults automatically.
+# -----------------------------------------------------------------------------
+proc setReceiveLimits*(ws: WebSocket, frameBytes, messageBytes: int) =
+  if frameBytes <= 0 or messageBytes <= 0:
+    raise newException(ValueError, "WebSocket receive limits must be positive")
+  ws.maxFrameBytes = frameBytes
+  ws.maxMessageBytes = messageBytes
+
+# -----------------------------------------------------------------------------
+# Return receive limits for WebSockets created through any constructor.
+# -----------------------------------------------------------------------------
+proc frameLimit(ws: WebSocket): int =
+  if ws.maxFrameBytes > 0: ws.maxFrameBytes
+  else: DefaultMaxFrameBytes
+
+proc messageLimit(ws: WebSocket): int =
+  if ws.maxMessageBytes > 0: ws.maxMessageBytes
+  else: DefaultMaxMessageBytes
 
 func newWebSocketClosedError(): auto =
   newException(WebSocketClosedError, "Socket closed")
@@ -371,7 +403,8 @@ proc recvExact(ws: WebSocket, count: int): Future[string] {.async.} =
       raise newWebSocketClosedError()
     result.add(data)
 
-proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
+proc recvFrame(ws: WebSocket, remainingMessageBytes: int):
+    Future[Frame] {.async.} =
   ## Gets a frame from the WebSocket.
   ## See https://tools.ietf.org/html/rfc6455#section-5.2
 
@@ -397,23 +430,43 @@ proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
     ws.readyState = Closed
     raise newException(WebSocketError, "WebSocket rsv mismatch")
 
-  # Payload length can be 7 bits, 7+16 bits, or 7+64 bits.
-  var finalLen: uint = 0
+  # Decode the full 64-bit network-order length without pointer casts.
+  # Reject invalid and oversized lengths before reading a mask or payload.
+  let headerLen = uint64(b1 and 0x7f)
+  var payloadLen = headerLen
+  if headerLen == 126'u64:
+    let length = await ws.recvExact(2)
+    payloadLen = (uint64(length[0].uint8) shl 8) or
+                 uint64(length[1].uint8)
+    if payloadLen < 126'u64:
+      ws.readyState = Closed
+      raise newException(WebSocketFrameLengthError,
+        "Non-minimal 16-bit WebSocket payload length")
+  elif headerLen == 127'u64:
+    let length = await ws.recvExact(8)
+    if (length[0].uint8 and 0x80'u8) != 0'u8:
+      ws.readyState = Closed
+      raise newException(WebSocketFrameLengthError,
+        "WebSocket 64-bit payload length has its high bit set")
+    payloadLen = 0'u64
+    for value in length:
+      payloadLen = (payloadLen shl 8) or uint64(value.uint8)
+    if payloadLen < 65536'u64:
+      ws.readyState = Closed
+      raise newException(WebSocketFrameLengthError,
+        "Non-minimal 64-bit WebSocket payload length")
 
-  let headerLen = uint(b1 and 0x7f)
-  if headerLen == 0x7e:
-    # Length must be 7+16 bits.
-    var length = await ws.recvExact(2)
-    finalLen = cast[ptr uint16](length[0].addr)[].htons
-
-  elif headerLen == 0x7f:
-    # Length must be 7+64 bits.
-    var length = await ws.recvExact(8)
-    finalLen = cast[ptr uint32](length[4].addr)[].htonl
-
-  else:
-    # Length must be 7 bits.
-    finalLen = headerLen
+  # int() would truncate on 32-bit devices. Never convert until validated.
+  if payloadLen > uint64(high(int)) or
+      payloadLen > uint64(ws.frameLimit()):
+    ws.readyState = Closed
+    raise newException(WebSocketFrameTooLargeError,
+      "WebSocket frame exceeds receive limit")
+  if remainingMessageBytes < 0 or
+      payloadLen > uint64(remainingMessageBytes):
+    ws.readyState = Closed
+    raise newException(WebSocketMessageTooLargeError,
+      "WebSocket message exceeds receive limit")
 
   # Do we need to apply mask?
   result.mask = (b1 and 0x80) == 0x80
@@ -429,7 +482,7 @@ proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
     maskKey = await ws.recvExact(4)
 
   # Read the data.
-  result.data = await ws.recvExact(int(finalLen))
+  result.data = await ws.recvExact(int(payloadLen))
 
   if result.mask:
     # Apply mask, if we need too.
@@ -438,15 +491,21 @@ proc recvFrame(ws: WebSocket): Future[Frame] {.async.} =
 
 proc receivePacket*(ws: WebSocket): Future[(Opcode, string)] {.async.} =
   ## Wait for a string or binary packet to come in.
-  var frame = await ws.recvFrame()
+  let limit = ws.messageLimit()
+  var frame = await ws.recvFrame(limit)
   result[0] = frame.opcode
   result[1] = frame.data
-  # If there are more parts read and wait for them
-  while frame.fin != true:
-    frame = await ws.recvFrame()
+  # Enforce the aggregate limit before appending each continuation frame.
+  while not frame.fin:
+    frame = await ws.recvFrame(limit - result[1].len)
     if frame.opcode != Cont:
+      ws.readyState = Closed
       raise newWebSocketClosedError()
-    result[1].add frame.data
+    if frame.data.len > limit - result[1].len:
+      ws.readyState = Closed
+      raise newException(WebSocketMessageTooLargeError,
+        "WebSocket fragmented message exceeds receive limit")
+    result[1].add(frame.data)
 
   # Peer-initiated Close requires a Close response, not just a TCP teardown.
   # If we initiated the handshake, the incoming Close is the acknowledgement.
