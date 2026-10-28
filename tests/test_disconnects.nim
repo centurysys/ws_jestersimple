@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, strutils, ws
+import asyncdispatch, asynchttpserver, strutils, ws_jestersimple
 
 var server = newAsyncHttpServer()
 var curWs: WebSocket

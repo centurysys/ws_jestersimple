@@ -1,4 +1,4 @@
-import ws, asyncdispatch, strutils
+import ws_jestersimple, asyncdispatch, strutils
 
 var socket: WebSocket
 

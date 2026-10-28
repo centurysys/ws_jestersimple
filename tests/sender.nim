@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, ws_jestersimple
 
 proc main() {.async.} =
   var ws = await newWebSocket("ws://127.0.0.1:9001/ws")

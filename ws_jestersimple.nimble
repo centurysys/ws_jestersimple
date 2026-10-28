@@ -1,8 +1,8 @@
 # Package
 
-version       = "0.6.0"
+version       = "0.1.0"
 author        = "Andre von Houck"
-description   = "Simple WebSocket library for nim."
+description   = "WebSocket library with Jester Simple adapter (fork of treeform/ws)."
 license       = "MIT"
 srcDir        = "src"
 

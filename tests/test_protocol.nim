@@ -1,4 +1,4 @@
-include ../src/ws
+include ../src/ws_jestersimple
 
 block:
   # Test protocol mismatch.

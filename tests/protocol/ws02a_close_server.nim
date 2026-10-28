@@ -1,6 +1,6 @@
 # WS-02a: loopback-only test server for wire-level Close behavior.
 import std/[asyncdispatch, asynchttpserver, asyncnet, net, os, strutils]
-import ws
+import ws_jestersimple
 
 # -----------------------------------------------------------------------------
 # Test both directions of the Close handshake and the legacy close() wrapper.

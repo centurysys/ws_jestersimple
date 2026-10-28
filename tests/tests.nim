@@ -1,4 +1,4 @@
-include ../src/ws
+include ../src/ws_jestersimple
 
 assert 0b10000000u8[0] == true
 assert 0b00000000u8[0] == false

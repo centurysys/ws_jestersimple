@@ -1,6 +1,6 @@
 # WS-02c: verify full 64-bit lengths and bounded frame/message reception.
 import std/[asyncdispatch, asynchttpserver, asyncnet, net, os, strutils]
-import ws
+import ws_jestersimple
 
 var frameRejects = 0
 var messageRejects = 0

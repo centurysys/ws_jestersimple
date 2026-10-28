@@ -1,6 +1,6 @@
 # WS-02d: RFC 6455 receive-side frame validation and fragment handling.
 import std/[asyncdispatch, asynchttpserver, asyncnet, net, os, strutils]
-import ws
+import ws_jestersimple
 
 var protocolRejects = 0
 var unexpectedErrors = 0

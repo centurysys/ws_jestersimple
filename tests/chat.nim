@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, ws_jestersimple
 
 var connections = newSeq[WebSocket]()
 

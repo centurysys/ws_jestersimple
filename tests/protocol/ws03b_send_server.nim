@@ -1,6 +1,6 @@
 # WS-03b: concurrent writers, Close ordering, bounded send queue and deadlines.
 import std/[asyncdispatch, asynchttpserver, asyncnet, net, os, strutils]
-import ws
+import ws_jestersimple
 
 var writeTimeouts = 0
 var queueRejections = 0

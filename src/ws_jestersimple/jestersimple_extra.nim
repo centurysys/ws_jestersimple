@@ -2,7 +2,7 @@
 # The HTTP transport owns the AsyncSocket; a route must await the WS session.
 import std/[asyncdispatch, base64, httpcore, strutils]
 import jestersimple
-import ws
+import ws_jestersimple
 
 # -----------------------------------------------------------------------------
 # Read exactly one HTTP header field; do not ignore ambiguous duplicates.

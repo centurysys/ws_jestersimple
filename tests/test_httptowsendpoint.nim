@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, httpClient, strutils, ws
+import asyncdispatch, asynchttpserver, httpClient, strutils, ws_jestersimple
 
 var server = newAsyncHttpServer()
 proc serverCb(req: Request) {.async, gcsafe.} =

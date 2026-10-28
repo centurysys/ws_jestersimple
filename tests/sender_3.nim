@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, httpclient, ws
+import asyncdispatch, asynchttpserver, httpclient, ws_jestersimple
 
 # Create three sockets and read from each of them asynchronously
 

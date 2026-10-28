@@ -1,6 +1,6 @@
 # WS-02b: loopback server for split TCP reads and truncated frames.
 import std/[asyncdispatch, asynchttpserver, asyncnet, net, os, strutils]
-import ws
+import ws_jestersimple
 
 var eofCount = 0
 var closedEofCount = 0

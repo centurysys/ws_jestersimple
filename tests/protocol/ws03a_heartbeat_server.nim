@@ -1,6 +1,6 @@
 # WS-03a: control-frame receive helpers, periodic Ping lifetime and deadlines.
 import std/[asyncdispatch, asynchttpserver, asyncnet, net, os, strutils]
-import ws
+import ws_jestersimple
 
 var readTimeouts = 0
 var heartbeatTimeouts = 0

@@ -1,8 +1,8 @@
 # WS-01: loopback-only Jester Simple / treeform-ws integration server.
 import std/[net, os, strutils]
 import jestersimple
-import ws
-import ws/jestersimple_extra
+import ws_jestersimple
+import ws_jestersimple/jestersimple_extra
 
 settings:
   port = Port(parseInt(getEnv("WS01_PORT", "5541")))

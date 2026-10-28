@@ -1,4 +1,4 @@
-import jester, ws, ws/jester_extra
+import jester, ws_jestersimple, ws_jestersimple/jester_extra
 
 routes:
   get "/ws":

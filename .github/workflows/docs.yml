@@ -7,7 +7,7 @@ on:
 permissions:
   contents: write
 env:
-  nim-src: src/${{ github.event.repository.name }}.nim
+  nim-src: src/ws_jestersimple.nim
   deploy-dir: .gh-pages
 jobs:
   docs:
@@ -19,10 +19,10 @@ jobs:
         shell: bash
         run: |
           cd ..
-          nimby install -g "${{ github.event.repository.name }}/${{ github.event.repository.name }}.nimble"
+          nimby install -g "${{ github.event.repository.name }}/ws_jestersimple.nimble"
       - run: nim doc --index:on --project --git.url:https://github.com/${{ github.repository }} --git.commit:master  --out:${{ env.deploy-dir }} ${{ env.nim-src }}
       - name: "Copy to index.html"
-        run: cp ${{ env.deploy-dir }}/${{ github.event.repository.name }}.html ${{ env.deploy-dir }}/index.html
+        run: cp ${{ env.deploy-dir }}/ws_jestersimple.html ${{ env.deploy-dir }}/index.html
       - name: Deploy documents
         uses: peaceiris/actions-gh-pages@v4
         with:

@@ -1,4 +1,4 @@
-import asyncdispatch, asynchttpserver, ws
+import asyncdispatch, asynchttpserver, ws_jestersimple
 
 proc main() {.async.} =
   # connect with "alpha" websocket protocol

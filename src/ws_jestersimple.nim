@@ -1,3 +1,4 @@
+# Forked from treeform/ws 0.6.0 (MIT). See LICENSE and README.md.
 import asyncdispatch, asynchttpserver, asyncnet, base64, httpclient, httpcore,
     nativesockets, net, random, std/sha1, std/monotimes, streams, strformat, strutils, uri
 
